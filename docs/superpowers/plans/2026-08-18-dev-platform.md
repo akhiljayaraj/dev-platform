@@ -11,6 +11,7 @@
 ## Global Constraints
 
 - GitHub is a **personal account** (owner login referred to below as `$OWNER`). No GitHub-Organization features — use **repository rulesets**, not org rulesets. Determine the value once: `OWNER=$(gh api user -q .login)`.
+- **All repos are created `--private`** (user decision). On a free plan, ruleset enforcement on private repos may be limited; Tasks 8/10/12 attempt it and must report honestly whether protection actually took effect. Do not claim enforcement works without evidence from `gh pr checks` / a rejected push.
 - All caller workflows **pin reusable workflows to the `v1` tag** (`uses: $OWNER/.github/.github/workflows/ci.yml@v1`), never `@main`.
 - Reusable CI must be **language-agnostic via inputs** (`language: node|python`); stages 1–5 must not hardcode a stack.
 - The **deploy step is the single swappable seam** — no test/lint/build stage may depend on the deploy provider.
@@ -39,7 +40,7 @@
 ```bash
 OWNER=$(gh api user -q .login)
 mkdir -p ~/dev-platform/repos
-gh repo create "$OWNER/.github" --public \
+gh repo create "$OWNER/.github" --private \
   --description "Platform: reusable workflows + account-wide defaults" \
   --clone
 mv "$OWNER/.github" ~/dev-platform/repos/.github 2>/dev/null || true
@@ -539,7 +540,7 @@ Expected: prints `refs/tags/v1`
 
 ```bash
 OWNER=$(gh api user -q .login)
-gh repo create "$OWNER/template-app" --public \
+gh repo create "$OWNER/template-app" --private \
   --description "Template for new projects (CI, tests, review, board wired in)" --clone
 mv "$OWNER/template-app" ~/dev-platform/repos/template-app 2>/dev/null || true
 cd ~/dev-platform/repos/template-app
@@ -954,7 +955,7 @@ git push
 ```bash
 OWNER=$(gh api user -q .login)
 date +%s > /tmp/smoke_start
-gh repo create "$OWNER/smoke-test" --template "$OWNER/template-app" --public --clone
+gh repo create "$OWNER/smoke-test" --template "$OWNER/template-app" --private --clone
 cd smoke-test
 ```
 
@@ -994,11 +995,15 @@ echo "Elapsed: $(( $(date +%s) - $(cat /tmp/smoke_start) )) seconds"
 ```
 Expected: setup-to-first-green-PR well under 600s (the 10-minute target). Note the number.
 
-- [ ] **Step 7: Clean up the smoke repo (optional)**
+- [ ] **Step 7: Clean up the smoke repo (optional — MANUAL, do not run in this session)**
+
+The current token lacks `delete_repo` scope, so deletion is left to the human to do later:
 
 ```bash
-gh repo delete "$OWNER/smoke-test" --yes
-cd .. && rm -rf smoke-test
+# Run manually when ready:
+#   gh auth refresh -s delete_repo
+#   gh repo delete "$OWNER/smoke-test" --yes
+cd .. && rm -rf smoke-test   # remove local clone only
 ```
 
 - [ ] **Step 8: Commit any ruleset corrections discovered**
