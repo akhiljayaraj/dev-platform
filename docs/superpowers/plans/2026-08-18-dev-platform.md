@@ -101,6 +101,9 @@ on:
         type: boolean
         default: true
 
+permissions:
+  contents: read
+
 jobs:
   lint:
     runs-on: ubuntu-latest
@@ -540,9 +543,11 @@ Expected: prints `refs/tags/v1`
 
 ```bash
 OWNER=$(gh api user -q .login)
+mkdir -p ~/dev-platform/repos && cd ~/dev-platform/repos
+# NOTE: `gh repo create --clone` clones into ./<reponame> in the CURRENT dir,
+# not ./<owner>/<reponame>. cd into repos/ first so the clone lands correctly.
 gh repo create "$OWNER/template-app" --private \
   --description "Template for new projects (CI, tests, review, board wired in)" --clone
-mv "$OWNER/template-app" ~/dev-platform/repos/template-app 2>/dev/null || true
 cd ~/dev-platform/repos/template-app
 ```
 
@@ -599,15 +604,17 @@ cp ~/dev-platform/repos/.github/workflow-templates/dependabot.yml .github/depend
     "lint": "eslint .",
     "typecheck": "tsc --noEmit",
     "test:unit": "vitest run --exclude '**/*.integration.test.ts'",
-    "test:integration": "vitest run **/*.integration.test.ts || echo 'no integration tests'",
+    "test:integration": "vitest run '**/*.integration.test.ts' || echo 'no integration tests'",
     "test": "vitest run",
     "build": "tsc -p tsconfig.json"
   },
   "devDependencies": {
     "@types/node": "^20",
+    "@vitest/coverage-v8": "^2",
     "eslint": "^9",
     "prettier": "^3",
     "typescript": "^5",
+    "typescript-eslint": "^8",
     "vitest": "^2"
   }
 }
@@ -625,15 +632,19 @@ cp ~/dev-platform/repos/.github/workflow-templates/dependabot.yml .github/depend
     "outDir": "dist",
     "skipLibCheck": true
   },
-  "include": ["src"]
+  "include": ["src"],
+  "exclude": ["**/*.test.ts"]
 }
 ```
 
 ```js
-// eslint.config.js
-export default [
-  { files: ["**/*.ts"], rules: {} }
-];
+// eslint.config.js  — flat config with the TypeScript parser (required, or eslint cannot parse .ts)
+import tseslint from "typescript-eslint";
+
+export default tseslint.config(
+  { ignores: ["dist/", "coverage/", "node_modules/"] },
+  ...tseslint.configs.recommended
+);
 ```
 
 ```json
@@ -693,7 +704,10 @@ Project scaffold. After creating a repo from this template, run:
 
     ./scripts/bootstrap.sh
 
-which wires CI, branch protection, labels, and the shared board.
+which substitutes the workflow owner, syncs labels, applies branch protection
+(best-effort — needs GitHub Pro or a public repo), and links the shared project
+board (best-effort — needs the `project` gh scope). CI runs automatically on your
+first PR.
 ```
 
 - [ ] **Step 5: Verify locally**
@@ -731,6 +745,9 @@ git push -u origin main
   "conditions": {
     "ref_name": { "include": ["refs/heads/main"], "exclude": [] }
   },
+  "bypass_actors": [
+    { "actor_id": 5, "actor_type": "RepositoryRole", "bypass_mode": "always" }
+  ],
   "rules": [
     { "type": "deletion" },
     { "type": "non_fast_forward" },
@@ -748,10 +765,11 @@ git push -u origin main
       "parameters": {
         "strict_required_status_checks_policy": true,
         "required_status_checks": [
-          { "context": "lint" },
-          { "context": "typecheck" },
-          { "context": "unit" },
-          { "context": "build" }
+          { "context": "ci / lint" },
+          { "context": "ci / typecheck" },
+          { "context": "ci / unit" },
+          { "context": "ci / integration" },
+          { "context": "ci / build" }
         ]
       }
     }
@@ -759,7 +777,7 @@ git push -u origin main
 }
 ```
 
-> Note: check contexts for reusable-workflow jobs appear as `ci / lint`, etc., depending on the caller job name. After the smoke test (Task 12) surfaces the exact context strings via `gh pr checks`, update this file to match and re-apply. Start with the short names; correct in Task 12 if needed.
+> Note: check contexts for a reusable workflow invoked from a caller job named `ci` are reported as `ci / <job>` (confirmed by the Task 12 smoke test: `ci / lint`, `ci / typecheck`, `ci / unit`, `ci / integration`, `ci / build`). The `bypass_actors` entry (RepositoryRole 5 = repo admin) lets a solo owner merge their own PRs while still requiring review from non-admins — without it, a single-owner repo self-locks once protection is active.
 
 - [ ] **Step 2: Verify JSON is valid**
 
@@ -791,14 +809,20 @@ git push
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Always operate from the repo root so relative paths below resolve.
+cd "$(git rev-parse --show-toplevel)"
 OWNER=$(gh api user -q .login)
-REPO=$(basename "$(git rev-parse --show-toplevel)")
+REPO=$(basename "$(pwd)")
 echo "Bootstrapping $OWNER/$REPO"
 
-# 1. Substitute the __OWNER__ placeholder in caller workflows
-grep -rl '__OWNER__' .github/workflows | while read -r f; do
-  sed -i.bak "s/__OWNER__/$OWNER/g" "$f" && rm -f "$f.bak"
-done
+# 1. Substitute the __OWNER__ placeholder in caller workflows.
+# Idempotent: guard with grep -q so a re-run (placeholder already substituted)
+# does not abort the whole script under `set -euo pipefail` (grep exits 1 on no match).
+if grep -rlq '__OWNER__' .github/workflows 2>/dev/null; then
+  grep -rl '__OWNER__' .github/workflows | while read -r f; do
+    sed -i.bak "s/__OWNER__/$OWNER/g" "$f" && rm -f "$f.bak"
+  done
+fi
 
 # 2. Sync labels from the platform repo
 tmp=$(mktemp)
@@ -813,12 +837,24 @@ for l in labels:
 PY
 rm -f "$tmp"
 
-# 3. Apply the branch-protection ruleset
-gh api -X POST "repos/$OWNER/$REPO/rulesets" \
-  --input .platform/ruleset.json >/dev/null
-echo "Ruleset applied."
+# 3. Apply the branch-protection ruleset (best-effort).
+# Rulesets are unavailable on free-plan PRIVATE repos (HTTP 403 "upgrade required").
+# Do not let that abort bootstrap under `set -euo pipefail` — warn and continue.
+if gh api -X POST "repos/$OWNER/$REPO/rulesets" --input .platform/ruleset.json >/dev/null 2>&1; then
+  echo "Ruleset applied — main is protected."
+else
+  echo "WARNING: branch-protection ruleset NOT applied. Rulesets need GitHub Pro (private repos) or a public repo. Continuing without enforced protection."
+fi
 
-# 4. Commit the owner substitution
+# 4. Link the repo to the shared project board (best-effort; needs the 'project' scope).
+PNUM=$(gh api "repos/$OWNER/.github/contents/PROJECT.md" -q .content 2>/dev/null | base64 -d 2>/dev/null | grep -i 'Project number' | grep -o '[0-9]\+' || true)
+if [ -n "${PNUM:-}" ] && gh project link "$PNUM" --owner "$OWNER" --repo "$OWNER/$REPO" >/dev/null 2>&1; then
+  echo "Linked to project board #$PNUM."
+else
+  echo "WARNING: could not link project board (need the 'project' scope, or PROJECT.md missing). Link later: gh project link <num> --owner $OWNER --repo $OWNER/$REPO"
+fi
+
+# 5. Commit the owner substitution
 git add .github/workflows
 git commit -m "chore: bootstrap project ($OWNER)" || echo "nothing to commit"
 echo "Done. Push and open your first PR."
@@ -920,7 +956,9 @@ gh project field-create "$PNUM" --owner "$OWNER" --name "Iteration" \
 set -euo pipefail
 OWNER=$(gh api user -q .login)
 REPO=$(basename "$(git rev-parse --show-toplevel)")
-PNUM=$(grep 'Project number' ~/dev-platform/repos/.github/PROJECT.md | grep -o '[0-9]\+')
+# Read the project number from PROJECT.md in the .github repo via the API,
+# so this works from any repo without assuming a local clone layout.
+PNUM=$(gh api "repos/$OWNER/.github/contents/PROJECT.md" -q .content | base64 -d | grep -i 'Project number' | grep -o '[0-9]\+')
 gh project link "$PNUM" --owner "$OWNER" --repo "$OWNER/$REPO"
 echo "Linked $OWNER/$REPO to project $PNUM"
 ```
@@ -978,15 +1016,17 @@ git push -u origin feat/smoke
 gh pr create --fill
 ```
 
-- [ ] **Step 4: Verify CI checks run and gate the PR**
+- [ ] **Step 4: Verify CI checks run and pass**
 
 Run: `gh pr checks feat/smoke --watch`
-Expected: `lint`, `typecheck`, `unit`, `build`, and CodeQL (`analyze`) checks appear and pass. Record the **exact context names** printed. If they differ from `.platform/ruleset.json` (e.g. `ci / lint`), update `template-app/.platform/ruleset.json` and re-apply to `template-app` and `smoke-test`, then re-run this step.
+Expected: `lint`, `typecheck`, `unit`, `build`, and CodeQL (`analyze`) checks appear and pass on the PR. Record the **exact context names** printed (e.g. `ci / lint`) — these are the values a `required_status_checks` ruleset will need once branch protection is enabled (Pro/public). This proves the pipeline runs end-to-end on a template-derived project.
 
-- [ ] **Step 5: Verify the merge is gated on review**
+- [ ] **Step 5: Complete the merge (enforcement deferred)**
 
-Run: `gh pr merge feat/smoke --squash --auto || echo "BLOCKED_PENDING_REVIEW_AS_EXPECTED"`
-Expected: merge does not complete immediately because 1 review is required — prints the blocked message (or queues as auto-merge pending review). This proves the review gate.
+NOTE: the user chose to proceed without the enforcement gate (free-plan private repos can't use rulesets), so the merge is NOT blocked on checks/review — that gate is deferred until GitHub Pro or public repos. Verify the end-to-end flow instead by squash-merging:
+
+Run: `gh pr merge feat/smoke --squash --delete-branch`
+Expected: the PR squash-merges into `main`. Record that the merge succeeded WITHOUT a gate, and note in the report that enforced protection is a documented deferred item.
 
 - [ ] **Step 6: Measure elapsed time and record results**
 
@@ -1006,14 +1046,9 @@ The current token lacks `delete_repo` scope, so deletion is left to the human to
 cd .. && rm -rf smoke-test   # remove local clone only
 ```
 
-- [ ] **Step 8: Commit any ruleset corrections discovered**
+- [ ] **Step 8: Record the check context names for future enforcement**
 
-```bash
-cd ~/dev-platform/repos/template-app
-git add .platform/ruleset.json 2>/dev/null || true
-git commit -m "fix: correct required-check context names from smoke test" || echo "no changes"
-git push || true
-```
+No ruleset is active (enforcement deferred), so there is nothing to re-apply. Instead, write the exact check context names observed in Step 4 into the report so that, when branch protection is later enabled (Pro/public), `template-app/.platform/ruleset.json`'s `required_status_checks` contexts can be set to match in one edit.
 
 ---
 
